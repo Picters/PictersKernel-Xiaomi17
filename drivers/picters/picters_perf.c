@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Picters performance caps — hard, in-kernel CPU frequency ceilings.
+ * Picters performance controls — independent in-kernel CPU ceilings/floors.
  *
  * The vendor perf HAL owns scaling_max_freq and rewrites it on load and on
  * thermal events, so a userspace cap only holds while something keeps
@@ -15,6 +15,8 @@
  * Interface (/sys/kernel/picters_perf):
  *   available     r  "<first-cpu>:<cpuinfo_max_freq_khz>" per cpufreq policy
  *   cpu_max_freq  rw "<first-cpu>:<khz>" pairs; khz 0 drops that policy's cap
+ *   cpu_min_freq  rw "<first-cpu>:<khz>" pairs; khz 0 drops that policy's floor
+ *   capabilities  r  supported API features
  *   profile       rw free-form label the app round-trips (kernel never reads it)
  */
 
@@ -37,6 +39,9 @@ struct picters_cap {
 	struct freq_qos_request req;
 	unsigned int khz;	/* requested ceiling, 0 = uncapped */
 	bool active;		/* req is currently registered on a live policy */
+	struct freq_qos_request floor_req;
+	unsigned int floor_khz; /* independent minimum request, 0 = no floor */
+	bool floor_active;
 };
 
 static DEFINE_MUTEX(picters_lock);
@@ -54,14 +59,19 @@ static void picters_drop_locked(struct picters_cap *c)
 }
 
 /*
- * Register/update/remove the FREQ_QOS_MAX request for the policy [cpu] leads.
+ * Register/update/remove one independent QoS request for the CPU policy.
+ * Floors request a supported stock frequency; they never remove or override
+ * the separate maximum requests held by thermal cooling devices.
  * [khz] is clamped into the policy's own range, so a caller can never ask for
  * a frequency the hardware doesn't have — and never for one above stock.
  */
-static int picters_set_cap(unsigned int cpu, unsigned int khz)
+static int picters_set_limit(unsigned int cpu, unsigned int khz, bool floor)
 {
 	struct cpufreq_policy *policy;
 	struct picters_cap *c;
+	struct freq_qos_request *req;
+	bool *active;
+	unsigned int *saved_khz;
 	int ret;
 
 	if (cpu >= nr_cpu_ids)
@@ -72,28 +82,34 @@ static int picters_set_cap(unsigned int cpu, unsigned int khz)
 	c = &picters_caps[cpumask_first(policy->related_cpus)];
 
 	mutex_lock(&picters_lock);
+	req = floor ? &c->floor_req : &c->req;
+	active = floor ? &c->floor_active : &c->active;
+	saved_khz = floor ? &c->floor_khz : &c->khz;
 
 	if (!khz) {
-		picters_drop_locked(c);
-		c->khz = 0;
+		if (*active) {
+			freq_qos_remove_request(req);
+			*active = false;
+		}
+		*saved_khz = 0;
 		ret = 0;
 		goto out;
 	}
 
 	khz = clamp(khz, policy->cpuinfo.min_freq, policy->cpuinfo.max_freq);
 
-	if (c->active) {
-		ret = freq_qos_update_request(&c->req, khz);
+	if (*active) {
+		ret = freq_qos_update_request(req, khz);
 	} else {
-		ret = freq_qos_add_request(&policy->constraints, &c->req,
-					   FREQ_QOS_MAX, khz);
+		ret = freq_qos_add_request(&policy->constraints, req,
+					   floor ? FREQ_QOS_MIN : FREQ_QOS_MAX, khz);
 		if (ret >= 0)
-			c->active = true;
+			*active = true;
 	}
 	if (ret < 0)
 		goto out;
 
-	c->khz = khz;
+	*saved_khz = khz;
 	ret = 0;
 out:
 	mutex_unlock(&picters_lock);
@@ -129,9 +145,20 @@ static int picters_policy_notifier(struct notifier_block *nb,
 			if (ret >= 0)
 				c->active = true;
 		}
+		if (c->floor_khz && !c->floor_active) {
+			ret = freq_qos_add_request(&policy->constraints,
+						   &c->floor_req, FREQ_QOS_MIN,
+						   c->floor_khz);
+			if (ret >= 0)
+				c->floor_active = true;
+		}
 		break;
 	case CPUFREQ_REMOVE_POLICY:
 		picters_drop_locked(c);
+		if (c->floor_active) {
+			freq_qos_remove_request(&c->floor_req);
+			c->floor_active = false;
+		}
 		break;
 	}
 	mutex_unlock(&picters_lock);
@@ -185,9 +212,7 @@ static ssize_t cpu_max_freq_show(struct kobject *kobj,
  * A pair naming a CPU with no cpufreq policy is skipped rather than failing
  * the write, so one absent cluster can't drop the caps for the others.
  */
-static ssize_t cpu_max_freq_store(struct kobject *kobj,
-				  struct kobj_attribute *attr,
-				  const char *buf, size_t count)
+static ssize_t picters_limits_store(const char *buf, size_t count, bool floor)
 {
 	const char *p = buf;
 	unsigned int applied = 0;
@@ -207,7 +232,7 @@ static ssize_t cpu_max_freq_store(struct kobject *kobj,
 		    *p != '\n' && *p != ',')
 			return -EINVAL;
 
-		ret = picters_set_cap(cpu, khz);
+		ret = picters_set_limit(cpu, khz, floor);
 		if (ret && ret != -ENODEV)
 			return ret;
 		if (!ret)
@@ -215,6 +240,42 @@ static ssize_t cpu_max_freq_store(struct kobject *kobj,
 	}
 
 	return applied ? count : -ENODEV;
+}
+
+static ssize_t cpu_max_freq_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	return picters_limits_store(buf, count, false);
+}
+
+static ssize_t cpu_min_freq_store(struct kobject *kobj,
+				  struct kobj_attribute *attr,
+				  const char *buf, size_t count)
+{
+	return picters_limits_store(buf, count, true);
+}
+
+static ssize_t cpu_min_freq_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	unsigned int cpu;
+	int len = 0;
+
+	mutex_lock(&picters_lock);
+	for_each_possible_cpu(cpu) {
+		if (picters_caps[cpu].floor_khz)
+			len += sysfs_emit_at(buf, len, "%u:%u\n", cpu,
+					     picters_caps[cpu].floor_khz);
+	}
+	mutex_unlock(&picters_lock);
+	return len;
+}
+
+static ssize_t capabilities_show(struct kobject *kobj,
+				 struct kobj_attribute *attr, char *buf)
+{
+	return sysfs_emit(buf, "api=2 cpu_max_freq cpu_min_freq\n");
 }
 
 static ssize_t profile_show(struct kobject *kobj, struct kobj_attribute *attr,
@@ -242,11 +303,15 @@ static ssize_t profile_store(struct kobject *kobj, struct kobj_attribute *attr,
 
 static struct kobj_attribute available_attr = __ATTR_RO(available);
 static struct kobj_attribute cpu_max_freq_attr = __ATTR_RW(cpu_max_freq);
+static struct kobj_attribute cpu_min_freq_attr = __ATTR_RW(cpu_min_freq);
+static struct kobj_attribute capabilities_attr = __ATTR_RO(capabilities);
 static struct kobj_attribute profile_attr = __ATTR_RW(profile);
 
 static struct attribute *picters_attrs[] = {
 	&available_attr.attr,
 	&cpu_max_freq_attr.attr,
+	&cpu_min_freq_attr.attr,
+	&capabilities_attr.attr,
 	&profile_attr.attr,
 	NULL,
 };
