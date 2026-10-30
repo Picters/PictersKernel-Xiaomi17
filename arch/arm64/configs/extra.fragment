@@ -252,3 +252,8 @@ CONFIG_NTFS3_FS_POSIX_ACL=y
 # builtin that exports nothing and touches no frozen struct (adds only its own
 # symbols to vmlinux, same class as the NFS builtin above).
 CONFIG_PICTERS_PERF=y
+
+# Governors selected by the optional Gaming profile. The default governor is
+# unchanged; the app switches only after saving each domain's live governor.
+CONFIG_CPU_FREQ_GOV_PERFORMANCE=y
+CONFIG_DEVFREQ_GOV_PERFORMANCE=y
