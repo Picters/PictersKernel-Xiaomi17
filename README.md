@@ -20,17 +20,6 @@ Built on [Kokuban's kernel](https://github.com/YuzakiKokuban/android_kernel_xiao
 
 Choose by your **vendor KMI**, even if your ROM runs a newer Android version. Use the kernel and PictersKernelPack from the same build.
 
-## Tested devices
-
-| Device | A16 | A17 |
-| --- | :---: | :---: |
-| Xiaomi 17 | ✅ | ✅ |
-| Xiaomi 17 Pro | ? | ? |
-| Xiaomi 17 Pro Max | ? | ? |
-| Xiaomi 17 Ultra | ? | ? |
-
-✅ Tested · ? Awaiting reports. Results depend on the firmware and vendor KMI.
-
 Using a Pro, Pro Max or Ultra? [Let me know in Issues](https://github.com/Picters/PictersKernel-Xiaomi17/issues/new) if it works. Include your model, ROM and vendor KMI.
 
 ## Install
